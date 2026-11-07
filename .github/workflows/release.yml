@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to build, for example v0.4.12"
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+          - os: macos-15
+            bundles: app,dmg
+          - os: ubuntu-22.04
+            bundles: deb,appimage
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni-crypto/vid-editor
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Check the tag matches the app version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          app="$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")"
+          if [ "v$app" != "$RELEASE_TAG" ]; then
+            echo "Tag $RELEASE_TAG is on a commit whose app version is $app. Merge the version bump first, then tag that commit." >&2
+            exit 1
+          fi
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build --filter='!@vid/site'
+      - run: bash apps/desktop/scripts/fetch-tools.sh
+      - name: Put the fetched ffmpeg on PATH for the tests
+        run: echo "$VID_BUNDLE_TOOLS_DIR" >> "$GITHUB_PATH"
+      - run: pnpm test --filter='!@vid/site'
+      - run: node scripts/prepare-engine.mjs
+        working-directory: apps/desktop
+      - uses: actions/cache@v4
+        with:
+          path: apps/desktop/src-tauri/target/components
+          key: components-${{ runner.os }}-${{ hashFiles('apps/desktop/components.json') }}
+      - name: Download the published engine runtime and models
+        working-directory: apps/desktop
+        run: node scripts/fetch-components.mjs --runtime
+      - name: Check the app with the runtime users will download
+        working-directory: apps/desktop
+        run: src-tauri/target/components/runtime/bin/node scripts/smoke-engine.mjs
+      - run: cargo test
+        working-directory: apps/desktop/src-tauri
+      - name: Require the update signing key
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$KEY" || { echo "TAURI_SIGNING_PRIVATE_KEY secret is not set" >&2; exit 1; }
+      - name: Build installers
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          for attempt in 1 2 3; do
+            node_modules/.bin/tauri build --bundles ${{ matrix.bundles }} && exit 0
+            echo "Packaging attempt $attempt failed" >&2
+            sleep 20
+          done
+          exit 1
+      - name: Upload installers to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_REPO: yoni-crypto/vid-releases
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          tag="app-${RELEASE_TAG}"
+          if ! draft="$(gh release view "$tag" -R "$RELEASE_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            gh release create "$tag" -R "$RELEASE_REPO" --draft --title "Vid ${RELEASE_TAG#v}" --notes "Installers built by the Release workflow." || true
+            if ! draft="$(gh release view "$tag" -R "$RELEASE_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+              echo "could not read draft release $tag" >&2
+              exit 1
+            fi
+          fi
+          if [ "$draft" != "true" ]; then
+            echo "$tag is already published. Published release files are permanent (docs/desktop-release.md); raise the version instead." >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe.sig
+            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+            apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage.sig
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no installers found" >&2
+            exit 1
+          fi
+          gh release upload "$tag" "${files[@]}" -R "$RELEASE_REPO" --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      RELEASE_REPO: yoni-crypto/vid-releases
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Require the release token
+        run: test -n "$GH_TOKEN" || { echo "RELEASE_TOKEN secret is not set" >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni-crypto/vid-editor
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Download installer signatures from the draft release
+        run: |
+          tag="app-${RELEASE_TAG}"
+          mkdir -p dist
+          gh release download "$tag" -R "$RELEASE_REPO" -D dist --pattern '*.sig' --clobber
+          shopt -s nullglob
+          sigs=(dist/*.sig)
+          if [ ${#sigs[@]} -eq 0 ]; then
+            echo "no signatures found on $tag" >&2
+            exit 1
+          fi
+          for sig in "${sigs[@]}"; do
+            touch "${sig%.sig}"
+          done
+          ls -l dist
+      - name: Write latest.json for the updater
+        run: node apps/desktop/scripts/make-latest-json.mjs dist "${RELEASE_TAG#v}" "https://github.com/${RELEASE_REPO}/releases/download/app-${RELEASE_TAG}"
+      - name: Upload latest.json to the draft release
+        run: |
+          tag="app-${RELEASE_TAG}"
+          if draft="$(gh release view "$tag" -R "$RELEASE_REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" != "true" ]; then
+              echo "$tag is already published. Published release files are permanent (docs/desktop-release.md); raise the version instead." >&2
+              exit 1
+            fi
+          else
+            echo "draft release $tag is missing" >&2
+            exit 1
+          fi
+          gh release upload "$tag" dist/latest.json -R "$RELEASE_REPO" --clobber
+          gh release view "$tag" -R "$RELEASE_REPO" --json assets --jq '.assets[] | "\(.name) \(.size)"'
